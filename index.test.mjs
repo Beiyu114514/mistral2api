@@ -11,19 +11,26 @@ const createPlugin = _internal.createPlugin
 // Every test in this file runs inside its own environment snapshot. A
 // developer's own MISTRAL_API_KEY — or their ~/.vibe/.env — must not turn a
 // test green or red, and no test may leave a variable behind for the next
-// one: each starts from the same empty VIBE_HOME and gets its snapshot back.
+// one: each starts from the same empty VIBE_HOME, a session file of its own,
+// and gets its snapshot back.
 // The wrapper shadows the runner's own test on purpose, so a test cannot
 // forget to be isolated.
 const EMPTY_VIBE_HOME = mkdtempSync(join(tmpdir(), "vibe-test-"))
 const KEYS = /^(MISTRAL_|VIBE_)/
+let SESSIONS = 0
 const test = (name, fn) =>
   nodeTest(name, async () => {
     const saved = { ...process.env }
     for (const k of Object.keys(process.env)) if (KEYS.test(k)) delete process.env[k]
     process.env.VIBE_HOME = EMPTY_VIBE_HOME
+    // and the session file of its own: a renewal one test wrote must not
+    // answer the next test's requests
+    const session = join(EMPTY_VIBE_HOME, `session-${SESSIONS++}.json`)
+    process.env.VIBE_SESSION_FILE = session
     try {
       return await fn()
     } finally {
+      rmSync(session, { force: true })
       for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]
       for (const k of Object.keys(saved)) process.env[k] = saved[k]
     }
@@ -480,6 +487,152 @@ test("a renewed bundle is reused by the next request instead of the consumed ref
   assert.deepEqual(spentTokens, ["rt0"], "the consumed refresh token is presented once, not twice")
   assert.equal(first.token, `Bearer ${minted[0]}`)
   assert.equal(second.token, `Bearer ${minted[0]}`, "the second turn goes out on the renewed sign-in")
+})
+
+test("a long day of turns renews from the newest bundle, never from a spent one", async () => {
+  // the local clock is the one that says a token is spent, so the day is
+  // walked an hour at a time rather than waited out
+  const realNow = Date.now
+  let NOW = realNow()
+  Date.now = () => NOW
+  try {
+    // Mistral's refresh token is single-use: one a renewal already spent is
+    // answered invalid_grant, which is how a chain that renews off a stale
+    // bundle shows up
+    const spentRefresh = new Set()
+    const minted = []
+    const f = fakeFetch([
+      [".well-known", () => json(200, { authorization_endpoint: "a", token_endpoint: "https://auth.example/token" })],
+      ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+      ["/token", (url, init) => {
+        const rt = new URLSearchParams(init.body).get("refresh_token")
+        if (spentRefresh.has(rt)) return json(400, { error: "invalid_grant" })
+        spentRefresh.add(rt)
+        const id = mkId({ sub: "chain", exp: Math.floor(NOW / 1000) + 3600 })
+        minted.push(id)
+        return json(200, { access_token: `at${minted.length}`, refresh_token: `rt${minted.length}`, id_token: id, expires_in: 3600 })
+      }],
+      ["/chat/completions", (url, init) => json(200, { token: init.headers.get("authorization") })],
+    ])
+    const p = await createPlugin({ fetchImpl: f })
+    // the host hands back the same stored bundle every turn: it has no way to
+    // write a renewal back, so the refresh token it holds was spent by the
+    // very first one
+    const stored = {
+      type: "oauth", access: "at0", refresh: "rt0", expires: NOW - 1000,
+      idToken: mkId({ sub: "chain" }), subject: "chain",
+    }
+    const loader = await p.auth.loader(async () => stored)
+    for (let turn = 1; turn <= 5; turn++) {
+      const res = await loader.fetch(`${_internal.BASE}/chat/completions`, { method: "POST" })
+      assert.equal(res.status, 200, `turn ${turn}`)
+      assert.equal((await res.json()).token, `Bearer ${minted[turn - 1]}`, `turn ${turn} went out on the newest bundle`)
+      NOW += 61 * 60 * 1000
+    }
+    assert.equal(minted.length, 5, "one renewal per turn, each off the newest refresh token")
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test("remember keeps the host's key under the cap, one key per bundle", () => {
+  const f = fakeFetch([])
+  const bundle = (n) => ({ type: "oauth", access: `at${n}`, refresh: `rt${n - 1}`, expires: n, idToken: mkId(), subject: "s" })
+  const host = bundle(1)
+  let previous = host
+  for (let n = 2; n <= 80; n++) {
+    const renewed = bundle(n)
+    _internal.remember(f, renewed, previous)
+    previous = renewed
+  }
+  // more renewals than the map's cap: the tokens spent on the way are never
+  // looked up again, so they are dropped rather than left to push the one key
+  // the host does look up out of the map
+  assert.equal(_internal.currentOidc(f, host).access, "at80")
+})
+
+test("newerSession answers with the session file's bundle only when it is this account's and newer", () => {
+  const HOUR = 3600_000
+  const f = fakeFetch([])
+  const stored = { type: "oauth", access: "at1", refresh: "rt1", expires: Date.now() + 2 * HOUR, idToken: mkId({ sub: "a" }), subject: "a" }
+  _internal.saveSession(f, stored)
+  const older = { type: "oauth", access: "at0", refresh: "rt0", expires: Date.now() + HOUR, idToken: mkId({ sub: "a" }), subject: "a" }
+  assert.equal(_internal.newerSession(f, older), stored, "the file's is the one whose refresh token is unspent")
+  assert.equal(_internal.newerSession(f, stored), stored)
+  const newer = { type: "oauth", access: "at2", refresh: "rt2", expires: Date.now() + 3 * HOUR, idToken: mkId({ sub: "a" }), subject: "a" }
+  assert.equal(_internal.newerSession(f, newer), newer, "a newer sign-in is not shadowed by the file")
+  const other = { type: "oauth", access: "at9", refresh: "rt9", expires: Date.now() + 4 * HOUR, idToken: mkId({ sub: "b" }), subject: "b" }
+  assert.equal(_internal.newerSession(f, other), other, "another account's session is never sent in its place")
+  const key = { type: "api", key: "k" }
+  assert.equal(_internal.newerSession(f, key), key)
+})
+
+test("a session file another process advanced past the cached bundle is read again", () => {
+  const f = fakeFetch([])
+  const cached = { type: "oauth", access: "at1", refresh: "rt1", expires: 1000, idToken: mkId({ sub: "a" }), subject: "a" }
+  _internal.saveSession(f, cached)
+  // the file on disk moved on without this process: another host renewed the
+  // chain, and the refresh token the cached bundle holds was spent by it
+  const fresh = { type: "oauth", access: "at2", refresh: "rt2", expires: 9e15, idToken: mkId({ sub: "a" }), subject: "a" }
+  writeFileSync(_internal.sessionPath(), JSON.stringify(fresh))
+  assert.deepEqual(_internal.loadSession(f), fresh)
+  assert.equal(_internal.newerSession(f, { ...cached, access: "at0" }).access, "at2")
+})
+
+test("a restart answers from the session file, spending no refresh token", async () => {
+  // one Mistral behind two plugin instances: the second is a process that
+  // started after the first one's renewals, with the same account storage
+  const spentRefresh = new Set()
+  const minted = []
+  const routes = () => [
+    [".well-known", () => json(200, { authorization_endpoint: "a", token_endpoint: "https://auth.example/token" })],
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/token", (url, init) => {
+      const rt = new URLSearchParams(init.body).get("refresh_token")
+      if (spentRefresh.has(rt)) return json(400, { error: "invalid_grant" })
+      spentRefresh.add(rt)
+      const id = mkId({ sub: "again", exp: Math.floor(Date.now() / 1000) + 3600 })
+      minted.push(id)
+      return json(200, { access_token: `at${minted.length}`, refresh_token: `rt${minted.length}`, id_token: id, expires_in: 3600 })
+    }],
+    ["/chat/completions", (url, init) => json(200, { token: init.headers.get("authorization") })],
+  ]
+  const stored = {
+    type: "oauth", access: "at0", refresh: "rt0", expires: Date.now() - 1000,
+    idToken: mkId({ sub: "again" }), subject: "again",
+  }
+  const turn = async (p) =>
+    (await (await p.auth.loader(async () => stored)).fetch(`${_internal.BASE}/chat/completions`, { method: "POST" })).json()
+
+  const first = await createPlugin({ fetchImpl: fakeFetch(routes()) })
+  assert.equal((await turn(first)).token, `Bearer ${minted[0]}`)
+  // the renewal is kept where a restart can find it
+  const file = JSON.parse(readFileSync(_internal.sessionPath(), "utf8"))
+  assert.equal(file.refresh, "rt1")
+  assert.equal(file.idToken, minted[0])
+
+  // the restart: nothing in memory, and the account storage still holds the
+  // sign-in's bundle — whose refresh token the first run already spent
+  const second = await createPlugin({ fetchImpl: fakeFetch(routes()) })
+  assert.equal((await turn(second)).token, `Bearer ${minted[0]}`)
+  assert.equal(minted.length, 1, "the restart renewed nothing: the file held a usable bundle")
+})
+
+test("a session file that cannot be written leaves the turn working", async () => {
+  process.env.VIBE_SESSION_FILE = "/no-such-dir-vibe/session.json"
+  const f = fakeFetch([
+    [".well-known", () => json(200, { authorization_endpoint: "a", token_endpoint: "https://auth.example/token" })],
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/token", () => json(200, { access_token: "at", refresh_token: "rt1", id_token: mkId({ sub: "ro" }), expires_in: 3600 })],
+    ["/chat/completions", (url, init) => json(200, { token: init.headers.get("authorization") })],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const loader = await p.auth.loader(async () => ({
+    type: "oauth", access: "at0", refresh: "rt0", expires: Date.now() - 1000,
+    idToken: mkId({ sub: "ro" }), subject: "ro",
+  }))
+  const res = await loader.fetch(`${_internal.BASE}/chat/completions`, { method: "POST" })
+  assert.equal(res.status, 200)
 })
 
 test("callbackServer gives the loopback port back when the browser turns the sign-in down", async () => {

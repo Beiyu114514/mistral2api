@@ -19,7 +19,9 @@ own OIDC sign-in — the same client registration
 (`829da7e7-…`, audience `https://api.mistral.ai`), PKCE, and loopback redirect
 `http://127.0.0.1:8766/callback`, all read from the open-source CLI. The
 tokens are stored with OpenCode's and magpie's own account storage — the
-CLI's keyring is not read; sign-in here is its own session.
+CLI's keyring is not read; sign-in here is its own session — and every
+renewal is kept in a file of the plugin's own beside it, so the session
+survives a restart instead of asking to be redone.
 
 Requests carry the **ID token** beside the workspace headers the platform
 gateway requires (`x-external-organization-id`, `x-external-workspace-id`,
@@ -58,6 +60,21 @@ Mistral's own reset, and both reads are optional: a platform that does not
 serve them, or an account without the `see_org_inference_usage` permission
 the budget needs, shows no windows and says nothing about the sign-in.
 
+## The session outlives the process
+
+A renewal is written to the plugin's own session file,
+`.opencode-vibe-session.json` beside the CLI's config (`~/.vibe/` by default,
+`VIBE_HOME` to move it, `VIBE_SESSION_FILE` to name the file outright),
+alongside the host's account storage. OpenCode gives a plugin no way to
+write its storage back and never calls `auth.refresh`, so without the file a
+restart would present the sign-in's refresh token — which the first renewal
+had already spent — and be answered `invalid_grant` on its first request.
+The file is read back whenever the host's bundle is no longer the newest
+one, and a sign-in for another account is never answered from it. It is
+written beside its target and moved into place, so a reader never sees half
+a file, and a path that cannot be written changes nothing about the request
+path: the renewals of the running process still work.
+
 ## Two things worth knowing about Mistral's OIDC
 
 - **The ID token's `exp` claim is 8 hours behind UTC.** `auth.mistral.ai`
@@ -66,13 +83,15 @@ the budget needs, shows no windows and says nothing about the sign-in.
   for its full hour. Staleness is therefore read off the access token's
   `expires_in` alone, the way the CLI reads it; trusting the claim would
   spend a refresh on every call.
-- **The refresh token can be refused** (`invalid_grant`, "can not be
-  found"), which the CLI treats as re-login required and so does this
-  plugin: the sign-in lasts the access token's hour, then sign in again.
-  A refresh token here is single-use, so a turn spends at most one — one
-  renewal before the request, and one more only if the platform turns the
-  first token away — and the renewal it produced is the one the next
-  request goes out on.
+- **The refresh token is single-use and rotates.** Every renewal spends the
+  one it was given and hands back a new one, so a session is a chain, and
+  the host's storage still holds the bundle the first renewal superseded —
+  presenting its spent token again is answered `invalid_grant`. The newest
+  bundle is therefore tracked per process, one renewal before a request and
+  one more only if the platform turns the first token away, and kept in the
+  session file so a restart continues the chain rather than starting over.
+  A refresh that is refused outright still means sign in again, as it does
+  for the CLI.
 
 ## Chat turns are bounded
 
@@ -103,15 +122,18 @@ back already expired.
 
 Verified on one plan account (2026-11-06): the OIDC exchange, workspace
 discovery, `/v1/models` and the vibe-code catalog behind the tenant headers,
-the billing reads behind the same headers, and chat completions on `mistral-large-4-0`, `mistral-medium-latest`, the
+the billing reads behind the same headers, the renewal chain across five
+turns an hour apart, and a restart — a second process answered from the
+session file with the account storage still holding the spent bundle, and
+spent no refresh token to do it — and chat completions on `mistral-large-4-0`, `mistral-medium-latest`, the
 three `mistral-vibe-cli-*`, `codestral-2508`/`codestral-latest`,
 `mistral-code-latest`, `mistral-code-fim-latest`, `magistral-medium-latest`,
 `mistral-small-latest`, `ministral-14b/8b/3b-latest` and
 `voxtral-small-latest`.
 
 Not verified: another account's workspace layout, the budget reads on a paid
-plan (the verified account is FREE, with a $10 monthly allowance), whether
-the refresh grant ever succeeds (it was refused once), and limits taken from
-Mistral's docs rather than the catalog.
+plan (the verified account is FREE, with a $10 monthly allowance), a session
+left idle for days (the renewals verified here were minutes to an hour
+apart), and limits taken from Mistral's docs rather than the catalog.
 
 MIT. Not affiliated with Mistral.

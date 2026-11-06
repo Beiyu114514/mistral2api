@@ -18,7 +18,7 @@
 
 import { createHash, randomBytes } from "node:crypto"
 import { createServer } from "node:http"
-import { readFileSync } from "node:fs"
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 
 const ID = "vibe"
@@ -360,13 +360,106 @@ function currentOidc(fetchImpl, auth) {
 
 // remember keeps a renewal as the one that superseded the refresh token it
 // was renewed from.
+//
+// Every key that still resolves to the superseded bundle is re-pointed at the
+// renewal, not only the token it was renewed from: the host re-reads its own
+// storage on every request, and that storage still holds the bundle the FIRST
+// renewal superseded — so the key the host looks up has to track the newest
+// bundle all the way down a chain of renewals, or it resolves to a stale one
+// whose refresh token a later renewal already consumed. What is left is one
+// key per bundle: the tokens spent on the way are never looked up again once
+// the host's own key resolves, and leaving them would let the cap below evict
+// the one key that is looked up.
 const remember = (fetchImpl, auth, previous) => {
   if (!previous?.refresh) return auth
   let renewed = RENEWED.get(fetchImpl)
   if (!renewed) RENEWED.set(fetchImpl, (renewed = new Map()))
-  if (renewed.size >= RENEWED_MAX) renewed.delete(renewed.keys().next().value)
+  for (const [k, v] of renewed) if (v === previous) renewed.set(k, auth)
   renewed.set(previous.refresh, auth)
+  const kept = new Set()
+  for (const [k, v] of [...renewed]) {
+    if (kept.has(v)) renewed.delete(k)
+    else kept.add(v)
+  }
+  if (renewed.size >= RENEWED_MAX) renewed.delete(renewed.keys().next().value)
   return auth
+}
+
+// ---- the plugin's own session file -------------------------------------------
+
+// OpenCode gives a plugin no way to write its account storage back, and never
+// calls auth.refresh, so a renewal used to live only in this process: the
+// host's next request presented the sign-in's refresh token, which the first
+// renewal had already consumed, and a restart took every renewal with it. The
+// renewed bundle is therefore kept in a file of the plugin's own — the CLI's
+// keyring stays the CLI's, this is this sign-in's own session — and read back
+// whenever the host's bundle is no longer the newest one. magpie renews
+// through auth.refresh and keeps what it returns, so there the file is the
+// safety net rather than the only copy.
+const sessionPath = () =>
+  process.env.VIBE_SESSION_FILE ||
+  `${process.env.VIBE_HOME || `${homedir()}/.vibe`}/.opencode-vibe-session.json`
+
+// the file's bundle, read once per process and kept current by every renewal;
+// per fetchImpl, like the caches above, so a test's fake Mistral is never told
+// about the live one's sessions
+const SESSIONS = new WeakMap()
+
+const saveSession = (fetchImpl, auth) => {
+  if (auth?.type !== "oauth" || !auth.access || !auth.refresh) return
+  SESSIONS.set(fetchImpl, auth)
+  const path = sessionPath()
+  const tmp = `${path}.${process.pid}.tmp`
+  try {
+    // written beside the target and moved into place: two hosts (opencode and
+    // magpie) may renew at once, and a reader must never see half a file
+    writeFileSync(tmp, JSON.stringify({
+      access: auth.access,
+      refresh: auth.refresh,
+      idToken: auth.idToken,
+      expires: auth.expires,
+      idExpires: auth.idExpires,
+      subject: auth.subject,
+      email: auth.email,
+    }), { mode: 0o600 })
+    renameSync(tmp, path)
+  } catch {
+    // a session file that cannot be written leaves the sign-in where it was
+    // before the file existed: renewals still work for this process, and
+    // nothing about the request path changes
+    try {
+      rmSync(tmp, { force: true })
+    } catch {}
+  }
+}
+
+const loadSession = (fetchImpl) => {
+  const cached = SESSIONS.get(fetchImpl)
+  // a cached bundle that has run out is read again rather than kept: another
+  // process may have renewed the chain past it by then, and its refresh token
+  // is spent the moment that happened
+  if (cached && !spent(cached)) return cached
+  let found = null
+  try {
+    const t = JSON.parse(readFileSync(sessionPath(), "utf8"))
+    if (t?.access && t?.refresh) found = { type: "oauth", ...t }
+  } catch {}
+  SESSIONS.set(fetchImpl, found)
+  return found
+}
+
+// newerSession is the session file's bundle when it is the newer of the two:
+// a renewal in an earlier run rotated the refresh token the host still holds,
+// so the file's is the one that can still be renewed. A sign-in done after
+// that renewal is newer still and wins, so a re-login is never shadowed by
+// the file — and never answered with another account's session either.
+const newerSession = (fetchImpl, auth) => {
+  if (auth?.type !== "oauth") return auth
+  const stored = loadSession(fetchImpl)
+  if (stored?.type !== "oauth" || !stored.idToken) return auth
+  if (stored.subject && auth.subject && stored.subject !== auth.subject) return auth
+  if ((stored.expires ?? 0) <= (auth.expires ?? 0)) return auth
+  return remember(fetchImpl, stored, auth)
 }
 
 // freshOidc is the sign-in ready to send with, renewed when the access
@@ -381,7 +474,7 @@ const remember = (fetchImpl, auth, previous) => {
 // platform serves it all the same. Trusting that claim would spend a
 // refresh on every call and never send a request.
 async function freshOidc(fetchImpl, auth, { renewals = 0, force = false } = {}) {
-  const cur = currentOidc(fetchImpl, auth)
+  const cur = newerSession(fetchImpl, currentOidc(fetchImpl, auth))
   if (cur?.type !== "oauth" || !cur.idToken) throw new SignInExpired()
   if (!force && !spent(cur)) return { a: cur, renewed: false }
   if (!cur.refresh) throw new SignInExpired()
@@ -392,7 +485,11 @@ async function freshOidc(fetchImpl, auth, { renewals = 0, force = false } = {}) 
     flight = (async () => {
       try {
         const eps = await endpoints(fetchImpl)
-        return { ...cur, ...await refreshToken(fetchImpl, eps, cur.refresh) }
+        const renewed = { ...cur, ...await refreshToken(fetchImpl, eps, cur.refresh) }
+        // the renewal is the session from here on, in this process and past
+        // its end: the host's storage still holds what it was renewed from
+        saveSession(fetchImpl, renewed)
+        return renewed
       } finally {
         flights.delete(cur.refresh)
       }
@@ -638,6 +735,9 @@ function createPlugin({ fetchImpl = globalThis.fetch } = {}) {
                   const done = await waiting
                   try {
                     const t = await exchangeCode(fetchImpl, { code: done.code, verifier, nonce, redirectUri })
+                    // the sign-in is the session from the start: whatever an
+                    // earlier run left in the file is superseded by it
+                    saveSession(fetchImpl, t)
                     return {
                       type: "success",
                       access: t.access,
@@ -836,5 +936,6 @@ export const _internal = {
   BOOT, BASE, ID, ISSUER, CLIENT_ID, AUDIENCE, REDIRECT_URI, SCOPE, OAUTH_KEY, LEAD_MS, EARLY_MS,
   endpoints, tokensOf, refreshToken, freshOidc, spent, oidcHeaders, discoverTenant,
   tenantHeaders, exchangeCode, authorizationUrl, pkcePair, jwt, OidcError, SignInExpired,
-  callbackServer, redirectUriOf, currentOidc, MAX_RENEWALS, DEFAULT_ACCESS_MS, TURN_MS,
+  callbackServer, redirectUriOf, currentOidc, remember, MAX_RENEWALS, DEFAULT_ACCESS_MS, TURN_MS,
+  sessionPath, loadSession, saveSession, newerSession,
 }
