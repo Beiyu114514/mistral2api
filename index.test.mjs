@@ -573,6 +573,115 @@ test("usage keeps the account's identity when the model tables answer nothing", 
   assert.match(out.error, /no model list/)
 })
 
+test("budgetWindow reads the month the reset closes, and the usual month without one", () => {
+  assert.deepEqual(
+    _internal.budgetWindow({ usage_percentage: 40, reset_at: "2026-03-01T00:00:00Z" }, "Vibe Code"),
+    { name: "Vibe Code", used: 40, span: 2419200, resetsAt: "2026-03-01T00:00:00Z" },
+  )
+  // no reset to read back a month from: the window keeps the usual month
+  assert.deepEqual(
+    _internal.budgetWindow({ usage_percentage: 2.30805 }, "API"),
+    { name: "API", used: 2.30805, span: 2592000 },
+  )
+  assert.equal(_internal.budgetWindow(null, "API"), undefined)
+  assert.equal(_internal.budgetWindow({}, "API"), undefined)
+})
+
+test("usage on the OIDC account reports the plan and both quota windows", async () => {
+  const f = fakeFetch([
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/model-catalog", () => json(200, { models: [] })],
+    ["/models", () => json(200, { data: [{ id: "codestral-latest" }] })],
+    ["/billing/subscription", () => json(200, { plan_name: "TEAM", vibe_payg_enabled: true })],
+    ["/billing/budget", () => json(200, {
+      vibe_budget: { usage_percentage: 40, initial_budget: 100, reset_at: "2026-03-01T00:00:00Z" },
+      api_budget: { usage_percentage: 2.30805, initial_budget: 10, reset_at: "2026-12-01T00:00:00Z" },
+    })],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const out = await p.auth.usage(async () => ({
+    type: "oauth", access: "at", refresh: "rt",
+    expires: Date.now() + 3600_000,
+    idToken: mkId({ sub: "u20", exp: Math.floor(Date.now() / 1000) + 3600, email: "me@x.y" }),
+    idExpires: (Math.floor(Date.now() / 1000) + 3600) * 1000,
+    subject: "u20",
+    email: "me@x.y",
+  }))
+  assert.equal(out.user, "me@x.y")
+  assert.equal(out.plan, "TEAM")
+  assert.deepEqual(out.windows, [
+    { name: "Vibe Code", used: 40, span: 2419200, resetsAt: "2026-03-01T00:00:00Z" },
+    { name: "API", used: 2.30805, span: 2592000, resetsAt: "2026-12-01T00:00:00Z" },
+  ])
+})
+
+test("usage keeps the sign-in when the budget read is refused", async () => {
+  const f = fakeFetch([
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/model-catalog", () => json(200, { models: [] })],
+    ["/models", () => json(200, { data: [{ id: "codestral-latest" }] })],
+    ["/billing/subscription", () => json(200, { plan_name: "TEAM" })],
+    // the budget needs the see_org_inference_usage permission: a 403 here
+    // is a missing permission, not a refused credential
+    ["/billing/budget", () => json(403, {})],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const out = await p.auth.usage(async () => ({
+    type: "oauth", access: "at", refresh: "rt",
+    expires: Date.now() + 3600_000,
+    idToken: mkId({ sub: "u21", exp: Math.floor(Date.now() / 1000) + 3600, email: "me@x.y" }),
+    idExpires: (Math.floor(Date.now() / 1000) + 3600) * 1000,
+    subject: "u21",
+    email: "me@x.y",
+  }))
+  assert.equal(out.user, "me@x.y")
+  assert.equal(out.plan, "TEAM")
+  assert.deepEqual(out.windows, [])
+  assert.equal(out.signIn, undefined)
+})
+
+test("usage reports the windows when the subscription read fails", async () => {
+  const f = fakeFetch([
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/model-catalog", () => json(200, { models: [] })],
+    ["/models", () => json(200, { data: [{ id: "codestral-latest" }] })],
+    ["/billing/subscription", () => json(500, {})],
+    ["/billing/budget", () => json(200, {
+      vibe_budget: { usage_percentage: 40, initial_budget: 100, reset_at: "2026-12-01T00:00:00Z" },
+    })],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const out = await p.auth.usage(async () => ({
+    type: "oauth", access: "at", refresh: "rt",
+    expires: Date.now() + 3600_000,
+    idToken: mkId({ sub: "u22", exp: Math.floor(Date.now() / 1000) + 3600, email: "me@x.y" }),
+    idExpires: (Math.floor(Date.now() / 1000) + 3600) * 1000,
+    subject: "u22",
+    email: "me@x.y",
+  }))
+  assert.equal(out.plan, undefined)
+  assert.deepEqual(out.windows, [{ name: "Vibe Code", used: 40, span: 2592000, resetsAt: "2026-12-01T00:00:00Z" }])
+})
+
+test("usage on a pasted key reports the quota windows beside the key's state", async () => {
+  const f = fakeFetch([
+    ["/model-catalog", () => json(200, { models: [] })],
+    ["/models", () => json(200, { data: [{ id: "codestral-latest" }] })],
+    ["/billing/subscription", () => json(200, { plan_name: "FREE" })],
+    ["/billing/budget", () => json(200, {
+      vibe_budget: { usage_percentage: 40, initial_budget: 10, reset_at: "2026-12-01T00:00:00Z" },
+      api_budget: { usage_percentage: 2.30805, initial_budget: 10, reset_at: "2026-12-01T00:00:00Z" },
+    })],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const out = await p.auth.usage(async () => ({ type: "api", key: "k" }))
+  assert.equal(out.plan, "FREE")
+  assert.deepEqual(out.windows, [
+    { name: "Vibe Code", used: 40, span: 2592000, resetsAt: "2026-12-01T00:00:00Z" },
+    { name: "API", used: 2.30805, span: 2592000, resetsAt: "2026-12-01T00:00:00Z" },
+  ])
+})
+
 test("provider.models reads the tables with the OIDC tenant headers, catalog first", async () => {
   const f = fakeFetch([
     ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],

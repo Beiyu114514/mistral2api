@@ -47,10 +47,16 @@ the tables don't describe; every id in it answered a real chat turn on a plan
 account. Models outside the plan (`devstral-*`, `mistral-large-latest`) are
 left out — the platform answers them with `tier_not_allowed`.
 
-## Not included
+## Quota windows
 
-No usage windows: the read keeps the sign-in state (a refused credential
-marks the account expired and offers a retry).
+The account's allowances are read the way the vibe CLI's footer reads them:
+`/v1/billing/subscription` for the plan, `/v1/billing/budget` for the
+monthly Vibe Code allowance beside the platform balance. Both windows are
+shown — `usage_percentage` arrives already in percent, the 0.3744 the API
+answers is the $0.04 of $10 the admin console shows — the window closes at
+Mistral's own reset, and both reads are optional: a platform that does not
+serve them, or an account without the `see_org_inference_usage` permission
+the budget needs, shows no windows and says nothing about the sign-in.
 
 ## Two things worth knowing about Mistral's OIDC
 
@@ -97,14 +103,15 @@ back already expired.
 
 Verified on one plan account (2026-11-06): the OIDC exchange, workspace
 discovery, `/v1/models` and the vibe-code catalog behind the tenant headers,
-and chat completions on `mistral-large-4-0`, `mistral-medium-latest`, the
+the billing reads behind the same headers, and chat completions on `mistral-large-4-0`, `mistral-medium-latest`, the
 three `mistral-vibe-cli-*`, `codestral-2508`/`codestral-latest`,
 `mistral-code-latest`, `mistral-code-fim-latest`, `magistral-medium-latest`,
 `mistral-small-latest`, `ministral-14b/8b/3b-latest` and
 `voxtral-small-latest`.
 
-Not verified: another account's workspace layout, whether the refresh grant
-ever succeeds (it was refused once), and limits taken from Mistral's docs
-rather than the catalog.
+Not verified: another account's workspace layout, the budget reads on a paid
+plan (the verified account is FREE, with a $10 monthly allowance), whether
+the refresh grant ever succeeds (it was refused once), and limits taken from
+Mistral's docs rather than the catalog.
 
 MIT. Not affiliated with Mistral.

@@ -105,6 +105,8 @@ const explore = async (label) => {
   }
   const models = (await get("/models")).ids ?? []
   await get("/model-catalog?surface=vibe-code")
+  await get("/billing/subscription")
+  await get("/billing/budget")
 
   // the live lists first, the hardcoded ones after them, deduplicated
   const order = [...new Set([...models, ...CANDIDATES])].slice(0, 12)

@@ -44,6 +44,9 @@ const DEFAULT_ACCESS_MS = 60 * 60 * 1000
 // answers is reported instead of hanging the turn forever. It is the same
 // five minutes undici waits on its own, said out loud and with a message.
 const TURN_MS = Number(process.env.VIBE_TURN_TIMEOUT_MS) > 0 ? Number(process.env.VIBE_TURN_TIMEOUT_MS) : 5 * 60 * 1000
+// the length of a monthly allowance's cycle, for a window whose reset
+// cannot be read
+const MONTH_S = 30 * 24 * 3600
 
 // Models a Vibe plan serves, as the bootstrap the config hook starts with
 // and the fallback row for anything the live tables don't describe. The
@@ -162,6 +165,46 @@ async function modelTable(fetchImpl, headers) {
 
 // bearerOf is the headers a pasted key's tables are read with.
 const bearerOf = (key) => ({ authorization: `Bearer ${key}` })
+
+// billingOf reads the account's allowances the way the CLI's own footer
+// reads them (vibe/app_server/_billing.py): /billing/subscription names
+// the plan, /billing/budget the monthly Vibe Code allowance beside the
+// platform balance. Both are optional — a platform may not serve them,
+// and /budget needs the see_org_inference_usage permission — so every
+// failure answers an empty read and says nothing about the sign-in: a 403
+// here is a missing permission, not a refused credential.
+async function billingOf(fetchImpl, headers) {
+  const read = (path) => tableOf(fetchImpl, `${BASE}${path}`, headers).catch(() => null)
+  const [subscription, budget] = await Promise.all([
+    read("/billing/subscription"),
+    read("/billing/budget"),
+  ])
+  return {
+    plan: typeof subscription?.plan_name === "string" ? subscription.plan_name : undefined,
+    windows: [
+      budgetWindow(budget?.vibe_budget, "Vibe Code"),
+      budgetWindow(budget?.api_budget, "API"),
+    ].filter(Boolean),
+  }
+}
+
+// budgetWindow is one allowance as the quota window magpie shows. Mistral
+// answers the used percentage in percent — 0.3744 is 0.3744% of the
+// allowance, the $0.04 of $10 the admin console shows — and the reset as
+// an ISO instant; the span is the cycle that reset closes, read a month
+// back from it, or the month's usual length when there is no reset.
+function budgetWindow(b, name) {
+  if (typeof b?.usage_percentage !== "number") return undefined
+  const resetAt = typeof b.reset_at === "string" ? b.reset_at : undefined
+  const end = resetAt ? Date.parse(resetAt) : NaN
+  let span = MONTH_S
+  if (!Number.isNaN(end)) {
+    const start = new Date(end)
+    start.setUTCMonth(start.getUTCMonth() - 1)
+    span = Math.round((end - start.getTime()) / 1000)
+  }
+  return { name, used: b.usage_percentage, span, ...(resetAt ? { resetsAt: resetAt } : {}) }
+}
 
 // resolveApiKey turns a key the vibe CLI itself would resolve into the key
 // this plugin serves with, when no key is pasted: MISTRAL_API_KEY
@@ -696,9 +739,10 @@ function createPlugin({ fetchImpl = globalThis.fetch } = {}) {
         if (!key) return {}
         return { baseURL: BASE, apiKey: key }
       },
-      // the plan's quota windows are not read yet: the read keeps the
-      // sign-in state. A refused credential marks the account for sign-in;
-      // an unreachable table says nothing about the sign-in.
+      // the sign-in state first — a refused credential marks the account
+      // for sign-in, an unreachable table says nothing about it — then the
+      // plan's allowances beside it, as a read that says nothing about the
+      // sign-in either way.
       async usage(getAuth) {
         const auth = currentOidc(fetchImpl, await getAuth())
         if (auth?.type !== "oauth" && !liveKey(auth))
@@ -706,24 +750,34 @@ function createPlugin({ fetchImpl = globalThis.fetch } = {}) {
         try {
           if (auth?.type === "oauth") {
             const { a } = await freshOidc(fetchImpl, auth)
+            const headers = await oidcHeaders(fetchImpl, a)
             // the tables are the sign-in's own proof it still works; a
             // failure here is reported beside the identity, not instead
             // of it, and only a refusal marks the account for sign-in
             let error
             let signIn
             try {
-              const { ids } = await modelTable(fetchImpl, await oidcHeaders(fetchImpl, a))
+              const { ids } = await modelTable(fetchImpl, headers)
               if (!ids.length) error = "Mistral answered no model list for this account"
             } catch (e) {
               if (!(e instanceof Refused)) throw e
               error = "Mistral refused this sign-in; sign in again"
               signIn = "expired"
             }
-            return { user: a.email || a.subject, ...(error ? { error } : {}), ...(signIn ? { signIn } : {}), windows: [] }
+            const quota = await billingOf(fetchImpl, headers).catch(() => null)
+            return {
+              user: a.email || a.subject,
+              ...(quota?.plan ? { plan: quota.plan } : {}),
+              ...(error ? { error } : {}),
+              ...(signIn ? { signIn } : {}),
+              windows: quota?.windows ?? [],
+            }
           }
-          const { ids } = await modelTable(fetchImpl, bearerOf(liveKey(auth)))
+          const headers = bearerOf(liveKey(auth))
+          const { ids } = await modelTable(fetchImpl, headers)
           if (!ids.length) return { error: "Mistral answered no model list for this key", windows: [] }
-          return { windows: [] }
+          const quota = await billingOf(fetchImpl, headers).catch(() => null)
+          return { ...(quota?.plan ? { plan: quota.plan } : {}), windows: quota?.windows ?? [] }
         } catch (e) {
           if (e instanceof Refused)
             return { error: auth?.type === "oauth" ? "Mistral refused this sign-in; sign in again" : "Mistral refused this key; paste a fresh one", signIn: "expired", windows: [] }
@@ -778,7 +832,7 @@ function createPlugin({ fetchImpl = globalThis.fetch } = {}) {
 // test-fetch factory stays on createPlugin, _internal's.
 export const VibePlugin = async () => createPlugin()
 export const _internal = {
-  createPlugin, row, rowsFor, resolveApiKey, liveKey, modelTable, tableOf, bearerOf, Refused,
+  createPlugin, row, rowsFor, resolveApiKey, liveKey, modelTable, tableOf, bearerOf, Refused, billingOf, budgetWindow,
   BOOT, BASE, ID, ISSUER, CLIENT_ID, AUDIENCE, REDIRECT_URI, SCOPE, OAUTH_KEY, LEAD_MS, EARLY_MS,
   endpoints, tokensOf, refreshToken, freshOidc, spent, oidcHeaders, discoverTenant,
   tenantHeaders, exchangeCode, authorizationUrl, pkcePair, jwt, OidcError, SignInExpired,
