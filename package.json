@@ -1,0 +1,17 @@
+{
+  "name": "@magpie-community/opencode-vibe-auth",
+  "version": "0.0.1",
+  "description": "Mistral Vibe plan subscriptions (the vibe CLI's account) in OpenCode and magpie",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.mjs", "opencode.mjs", "README.md", "scripts"],
+  "scripts": {
+    "test": "node --test index.test.mjs"
+  },
+  "keywords": ["opencode", "opencode-plugin", "magpie", "vibe", "mistral"],
+  "license": "MIT"
+}
