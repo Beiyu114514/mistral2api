@@ -25,11 +25,36 @@
 // expired on arrival — the platform then answers 401 and only a re-login
 // helps.
 
-import { readFileSync, writeFileSync, rmSync } from "node:fs"
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs"
+import { randomUUID } from "node:crypto"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { _internal } from "../index.mjs"
 
-const STATE_FILE = "/tmp/vibe-live.json"
-const TOKEN_FILE = "/tmp/vibe-live-tokens.json"
+// Tokens are kept between the two commands, so the directory has to be
+// stable across processes. Keep it in the user's own tree, not in /tmp:
+// the refresh token is as sensitive as a password.
+const liveDir = () => {
+  const dir = process.env.VIBE_LIVE_DIR || join(process.env.VIBE_HOME || join(homedir(), ".vibe"), "live")
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    try { chmodSync(dir, 0o700) } catch {}
+  } catch (e) {
+    throw new Error(`cannot create ${dir}: ${e?.message ?? e}`)
+  }
+  return dir
+}
+const stateFile = () => join(liveDir(), "state.json")
+const tokenFile = () => join(liveDir(), "tokens.json")
+const writePrivate = (path, value) => {
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    writeFileSync(tmp, value, { mode: 0o600, flag: "wx" })
+    renameSync(tmp, path)
+  } finally {
+    try { rmSync(tmp, { force: true }) } catch {}
+  }
+}
 
 // models a Vibe plan plausibly serves, from the CLI's own tables
 const CANDIDATES = [
@@ -61,9 +86,9 @@ const text = async (res) => {
 
 const start = async () => {
   const { verifier, challenge } = _internal.pkcePair()
-  const state = crypto.randomUUID().replace(/-/g, "")
-  const nonce = crypto.randomUUID().replace(/-/g, "")
-  writeFileSync(STATE_FILE, JSON.stringify({ verifier, state, nonce, at: Date.now() }))
+  const state = randomUUID().replace(/-/g, "")
+  const nonce = randomUUID().replace(/-/g, "")
+  writePrivate(stateFile(), JSON.stringify({ verifier, state, nonce, at: Date.now() }))
   const url = await _internal.authorizationUrl(globalThis.fetch, { challenge, state, nonce })
   console.log("open this URL in the browser, sign in with your Vibe plan account and approve:\n")
   console.log(url + "\n")
@@ -75,8 +100,13 @@ const start = async () => {
 
 // saved is the token bundle as an auth object freshOidc/oidcHeaders take
 const saved = () => {
-  const t = JSON.parse(readFileSync(TOKEN_FILE, "utf8"))
-  return { type: "oauth", ...t }
+  let t
+  try {
+    t = JSON.parse(readFileSync(tokenFile(), "utf8"))
+  } catch {
+    throw new Error("no saved token bundle; run --start and --url first")
+  }
+  return { ...t, type: "oauth" }
 }
 
 const explore = async (label) => {
@@ -135,7 +165,7 @@ const explore = async (label) => {
 const finish = async (redirect) => {
   let savedState
   try {
-    savedState = JSON.parse(readFileSync(STATE_FILE, "utf8"))
+    savedState = JSON.parse(readFileSync(stateFile(), "utf8"))
   } catch {
     throw new Error("no saved sign-in; run: node scripts/live.mjs --start")
   }
@@ -145,12 +175,12 @@ const finish = async (redirect) => {
   if (q.state !== savedState.state) throw new Error("state mismatch: that URL belongs to a different sign-in; --start again")
   const t = await _internal.exchangeCode(globalThis.fetch, { code: q.code, verifier: savedState.verifier, nonce: savedState.nonce, redirectUri: _internal.redirectUriOf() })
   console.log("exchange ok:", { subject: t.subject, email: t.email, expires_in: Math.round((t.expires - Date.now()) / 1000) })
-  writeFileSync(TOKEN_FILE, JSON.stringify({
+  writePrivate(tokenFile(), JSON.stringify({
     access: t.access, refresh: t.refresh, idToken: t.idToken,
     expires: t.expires, idExpires: t.idExpires, subject: t.subject, email: t.email,
   }))
-  rmSync(STATE_FILE, { force: true })
-  console.log("token bundle saved to", TOKEN_FILE)
+  rmSync(stateFile(), { force: true })
+  console.log("token bundle saved to", tokenFile())
   await explore("fresh sign-in")
 }
 

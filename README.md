@@ -9,8 +9,11 @@ as the deeper reference. Unlike Devin, the vibe CLI's model traffic is the
 **plain Mistral La Plateforme chat completions API** — confirmed from the
 open-source CLI (`mistralai/mistral-vibe`): the harness calls
 `client.chat.stream_async` with `api_base` defaulting to
-`https://api.mistral.ai/v1` and `Authorization: Bearer`. So requests are not
-re-shaped: `@ai-sdk/openai-compatible` serves them, the way river's does.
+`https://api.mistral.ai/v1` and `Authorization: Bearer`. So the transport is
+`@ai-sdk/openai-compatible`, the way river's is. What differs is the body:
+Mistral validates chat completions against a **closed** schema and refuses
+the whole request over a single field it does not name, so the loader shapes
+each chat body before it goes out (see below).
 
 ## Signing in
 
@@ -20,14 +23,17 @@ own OIDC sign-in — the same client registration
 `http://127.0.0.1:8766/callback`, all read from the open-source CLI. The
 tokens are stored with OpenCode's and magpie's own account storage — the
 CLI's keyring is not read; sign-in here is its own session — and every
-renewal is kept in a file of the plugin's own beside it, so the session
-survives a restart instead of asking to be redone.
+renewal is kept in a `0600` file of the plugin's own beside it (its parent
+directory is created when needed), so the session survives a restart instead
+of asking to be redone.
 
 Requests carry the **ID token** beside the workspace headers the platform
 gateway requires (`x-external-organization-id`, `x-external-workspace-id`,
 discovered at `GET /v1/users/me/workspaces` with the token). Those headers
 are not optional: `/v1/models` answers **401** without them. That is what
 spends the plan's quota — verified end to end on a real plan account.
+The ID token's issuer, audience and nonce are checked at exchange, and its
+signature is verified against the issuer's discovery JWKS when advertised.
 
 `VIBE_CLI_OIDC_ORGANIZATION_ID` / `VIBE_CLI_OIDC_WORKSPACE_ID` pick an
 explicit workspace, as the CLI's own env overrides do. If the port is taken
@@ -46,8 +52,14 @@ Two tables are read, the way the CLI reads them: `/model-catalog?surface=vibe-co
 their limits, vision and reasoning efforts) first, then the account's
 `GET /v1/models`. A bootstrap list starts the config hook and fills the rows
 the tables don't describe; every id in it answered a real chat turn on a plan
-account. Models outside the plan (`devstral-*`, `mistral-large-latest`) are
-left out — the platform answers them with `tier_not_allowed`.
+account. Non-chat entries (embedding, OCR, moderation and the like) are
+filtered out. When the plan catalog is available it is also the allowlist:
+the account table only adds catalog ids or verified bootstrap ids, so platform
+models the plan rejects (`devstral-*`, `mistral-large-latest`) cannot become
+selectable just because `/v1/models` lists them. A pasted API key still sees
+every chat model the account advertises. Existing rows in the host's provider
+block are preserved as-is, including user-defined models; the plugin does not
+delete entries it did not create.
 
 ## Quota windows
 
@@ -72,8 +84,10 @@ had already spent — and be answered `invalid_grant` on its first request.
 The file is read back whenever the host's bundle is no longer the newest
 one, and a sign-in for another account is never answered from it. It is
 written beside its target and moved into place, so a reader never sees half
-a file, and a path that cannot be written changes nothing about the request
-path: the renewals of the running process still work.
+a file. A small on-disk lease serialises renewals across OpenCode and magpie,
+so their single-use refresh tokens cannot be spent twice; a path that cannot
+be written changes nothing about the request path: the renewals of the
+running process still work.
 
 ## Two things worth knowing about Mistral's OIDC
 
@@ -87,11 +101,53 @@ path: the renewals of the running process still work.
   one it was given and hands back a new one, so a session is a chain, and
   the host's storage still holds the bundle the first renewal superseded —
   presenting its spent token again is answered `invalid_grant`. The newest
-  bundle is therefore tracked per process, one renewal before a request and
-  one more only if the platform turns the first token away, and kept in the
-  session file so a restart continues the chain rather than starting over.
-  A refresh that is refused outright still means sign in again, as it does
-  for the CLI.
+  bundle is therefore tracked per process and serialised across processes
+  with a short file lease, one renewal before a request and one more only if
+  the platform turns the first token away, and kept in the session file so a
+  restart continues the chain rather than starting over. A refresh that is
+  refused outright still means sign in again, as it does for the CLI; the
+  refresh hook surfaces that as `SignInExpired`, while a transient token or
+  JWKS fetch failure is left for the next request to retry.
+
+## A chat body Mistral's schema takes
+
+La Plateforme validates a chat body with `additionalProperties: false`, and an
+unlisted field answers **422 Unprocessable Entity** — `extra_forbidden` with
+the field named in `loc` — refusing the whole request rather than ignoring it.
+An OpenAI-compatible client does not have to do anything wrong to hit that:
+LobeChat, and any client that sends the OpenAI-standard `user` field, does.
+magpie relays a chat client's body to a plugin provider as written, and its
+own Mistral normalizers are keyed on the provider's host, which for a plugin
+provider is the plugin id — so nothing between the client and Mistral removes
+the field. Both the plan and pasted-key loaders do, before the request goes
+out.
+
+A field that is a name Mistral spells differently is renamed rather than
+dropped, and a value outside a range is clamped rather than thrown away:
+
+| from | to |
+| --- | --- |
+| `user`, `verbosity`, `store`, `web_search_options`, `functions`, `function_call`, `safety_identifier`, `reasoning` | dropped |
+| `seed` | `random_seed` (only when `random_seed` is absent) |
+| `max_completion_tokens` | `max_tokens` (only when `max_tokens` is absent) |
+| `service_tier` | kept when it is `auto` or `standard_only`, dropped otherwise |
+| `temperature` above 1.5 | clamped to 1.5 |
+
+Messages are shaped per role: `developer` becomes `system`, and each role keeps
+only the fields Mistral's schema names for it, so a client's extras (`name` on
+a user turn, `is_error` on a tool turn) go without the turn. An assistant turn
+that carries reasoning — `reasoning_content`, `reasoning` or
+`reasoning_details` — has it folded into `content` as a `thinking` part, the
+shape Mistral accepts for a replayed turn, since there is no such field on an
+assistant message.
+
+Bodies that needed nothing are sent on as the same value: there is no
+`JSON.parse`/`stringify` round trip for them, so `0.30000000000000004` stays
+`0.30000000000000004`. Only a chat completions POST with a JSON body is
+shaped; `GET /v1/models`, the billing reads and a body that does not parse
+are untouched, and a stream is read once and replayed from the same bytes
+when a 401 makes the turn go again. A reshaped body's `content-length` is
+left to fetch to recompute.
 
 ## Chat turns are bounded
 
@@ -104,7 +160,9 @@ and a signal the host passes is honoured instead of it.
 ## Live check
 
 `scripts/live.mjs` runs the sign-in against real Mistral and prints what
-came back — nothing is stored:
+came back. Only the short-lived state and the token bundle are kept between
+the two commands, in a private `0700` directory under `$VIBE_HOME/live` (or
+`$VIBE_LIVE_DIR`) with `0600` files; delete that directory when done:
 
 ```sh
 node scripts/live.mjs --start                       # prints the browser URL
@@ -129,11 +187,15 @@ spent no refresh token to do it — and chat completions on `mistral-large-4-0`,
 three `mistral-vibe-cli-*`, `codestral-2508`/`codestral-latest`,
 `mistral-code-latest`, `mistral-code-fim-latest`, `magistral-medium-latest`,
 `mistral-small-latest`, `ministral-14b/8b/3b-latest` and
-`voxtral-small-latest`.
+`voxtral-small-latest`. Every rewrite in the table above except the legacy
+`function_call` companion of `functions` was sent to that account first as a
+bare body and answered 422 `extra_forbidden` naming the field it touches,
+then as the loader shapes it and answered 200.
 
 Not verified: another account's workspace layout, the budget reads on a paid
 plan (the verified account is FREE, with a $10 monthly allowance), a session
 left idle for days (the renewals verified here were minutes to an hour
-apart), and limits taken from Mistral's docs rather than the catalog.
+apart), limits taken from Mistral's docs rather than the catalog, and the
+shaping behind any host other than magpie's relay.
 
 MIT. Not affiliated with Mistral.

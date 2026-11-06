@@ -3,6 +3,9 @@
   "version": "0.0.1",
   "description": "Mistral Vibe plan subscriptions (the vibe CLI's account) in OpenCode and magpie",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "main": "./opencode.mjs",
   "exports": {
     ".": "./opencode.mjs",

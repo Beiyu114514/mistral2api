@@ -1,7 +1,8 @@
 import { test as nodeTest } from "node:test"
 import assert from "node:assert/strict"
+import { generateKeyPairSync, sign as signCrypto } from "node:crypto"
 import { createServer } from "node:http"
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { VibePlugin, _internal } from "./index.mjs"
@@ -198,6 +199,12 @@ const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
 const ID_CLAIMS = { iss: _internal.ISSUER, aud: _internal.CLIENT_ID, sub: "user-1", exp: Math.floor(Date.now() / 1000) + 3300, nonce: undefined }
 const mkId = (claims = {}) => ["h", b64({ ...ID_CLAIMS, ...claims }), "y"].join(".")
 const BUNDLE = (n = 3300, id = mkId()) => ({ access_token: "at", refresh_token: "rt", id_token: id, expires_in: n })
+const signedId = (claims, privateKey, header = { alg: "RS256", kid: "key-1" }) => {
+  const head = b64(header)
+  const payload = b64({ ...ID_CLAIMS, ...claims })
+  const data = `${head}.${payload}`
+  return `${data}.${signCrypto("sha256", Buffer.from(data), privateKey).toString("base64url")}`
+}
 
 // fetch of fake Mistral endpoints, routed by URL. res carries status/json/text.
 function fakeFetch(routes) {
@@ -246,6 +253,44 @@ test("exchangeCode trades the code, checks iss/aud/nonce, keeps the email", asyn
   assert.equal(up.get("grant_type"), "authorization_code")
   assert.equal(up.get("code"), "cd")
   await assert.rejects(() => _internal.exchangeCode(f, { code: "cd", verifier: "v", nonce: "other" }), /nonce/)
+})
+
+test("exchangeCode verifies the ID token against the discovery JWKS", async () => {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 })
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "key-1", use: "sig", alg: "RS256" }
+  const idToken = signedId({ sub: "jwk-user", nonce: "n", email: "jwk@x.y", exp: Math.floor(Date.now() / 1000) + 600 }, privateKey)
+  const discovery = {
+    issuer: _internal.ISSUER,
+    authorization_endpoint: "https://auth.example/authorize",
+    token_endpoint: "https://auth.example/token",
+    jwks_uri: "https://auth.example/jwks",
+  }
+  const good = fakeFetch([
+    [".well-known", () => json(200, discovery)],
+    ["/jwks", () => json(200, { keys: [jwk] })],
+    ["/token", () => json(200, { access_token: "at", refresh_token: "rt", id_token: idToken, expires_in: 600 })],
+  ])
+  const t = await _internal.exchangeCode(good, { code: "c", verifier: "v", nonce: "n" })
+  assert.equal(t.subject, "jwk-user")
+  assert.equal(t.email, "jwk@x.y")
+
+  const other = generateKeyPairSync("rsa", { modulusLength: 2048 })
+  const forged = signedId({ sub: "jwk-user", nonce: "n", exp: Math.floor(Date.now() / 1000) + 600 }, other.privateKey)
+  const bad = fakeFetch([
+    [".well-known", () => json(200, discovery)],
+    ["/jwks", () => json(200, { keys: [jwk] })],
+    ["/token", () => json(200, { access_token: "at", refresh_token: "rt", id_token: forged, expires_in: 600 })],
+  ])
+  await assert.rejects(() => _internal.exchangeCode(bad, { code: "c", verifier: "v", nonce: "n" }), /signature/)
+})
+
+test("a discovery document with an issuer but no JWKS is rejected", async () => {
+  const f = fakeFetch([[".well-known", () => json(200, {
+    issuer: _internal.ISSUER,
+    authorization_endpoint: "https://auth.example/authorize",
+    token_endpoint: "https://auth.example/token",
+  })]])
+  await assert.rejects(() => _internal.endpoints(f), /JWKS/)
 })
 
 test("refreshToken rotates credentials and keeps the old refresh when none is sent", async () => {
@@ -422,6 +467,339 @@ test("loader's fetch sends a Request's own method and body, with the plan's head
   assert.equal(chat.req.headers.get("x-external-organization-id"), "o1")
 })
 
+// ---- the request body Mistral's closed schema takes ---------------------------
+
+// A fetch that records the body each chat turn went out with, in either of
+// the two shapes a host hands one over: a Request, or a URL with an init.
+function bodyRecorder() {
+  const seen = []
+  const fetch = async (input, init) => {
+    const req = input instanceof Request ? input : null
+    const url = req ? req.url : String(input)
+    let body
+    if (init && "body" in init) body = init.body
+    else if (req) body = await req.text()
+    seen.push({
+      url,
+      req,
+      body: typeof body === "string" ? body : body == null ? null : new TextDecoder().decode(body),
+      headers: new Headers(req?.headers ?? init?.headers),
+    })
+    if (url.includes("/users/me/workspaces")) return json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })
+    return json(200, { ok: true })
+  }
+  fetch.seen = seen
+  fetch.chats = () => seen.filter((s) => s.url.includes("/chat/completions"))
+  return fetch
+}
+
+// the loader of a signed-in account over f, as the hosts call it
+const loaderOver = async (f) => {
+  const p = await createPlugin({ fetchImpl: f })
+  return p.auth.loader(async () => ({
+    type: "oauth", access: "at", refresh: "rt", expires: Date.now() + 3600_000, idToken: mkId({ sub: "u40" }), subject: "u40",
+  }))
+}
+
+const CHAT = `${_internal.BASE}/chat/completions`
+
+test("a chat body carrying a field Mistral does not name goes out without it", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  // the body LobeChat sent magpie's gateway, which forwarded it as written
+  // and was refused with 422 extra_forbidden @ body.user
+  const res = await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "mistral-medium-latest",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      user: "user_q9y2muJSdB5nFtc05GK2kom6nzr",
+      functions: [],
+      function_call: { name: "legacy" },
+    }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(f.chats().length, 1)
+  assert.equal(f.chats()[0].body, JSON.stringify({
+    model: "mistral-medium-latest",
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+  }))
+})
+
+test("seed goes out as random_seed, and the reply limit as the one field Mistral names", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", seed: 7, max_completion_tokens: 512, messages: [] }),
+  })
+  assert.deepEqual(JSON.parse(f.chats()[0].body), { model: "m", random_seed: 7, max_tokens: 512, messages: [] })
+})
+
+test("the reply limit is kept whichever spelling the client used, and the pair is never sent", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", max_tokens: 8, max_completion_tokens: 100, messages: [] }),
+  })
+  assert.deepEqual(JSON.parse(f.chats()[0].body), { model: "m", max_tokens: 8, messages: [] })
+})
+
+test("a service_tier Mistral does not answer is dropped, one it answers is kept", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", service_tier: "priority", messages: [] }),
+  })
+  assert.deepEqual(JSON.parse(f.chats()[0].body), { model: "m", messages: [] })
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", service_tier: "auto", messages: [] }),
+  })
+  assert.deepEqual(JSON.parse(f.chats()[1].body), { model: "m", service_tier: "auto", messages: [] })
+})
+
+test("a temperature past Mistral's ceiling goes out at the ceiling", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", temperature: 2.5, messages: [] }),
+  })
+  assert.equal(JSON.parse(f.chats()[0].body).temperature, 1.5)
+})
+
+test("a developer message goes out as a system one, and a turn's thinking where Mistral takes it", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "m",
+      messages: [
+        { role: "developer", content: "be brief" },
+        { role: "user", content: "hi", name: "alice" },
+        { role: "assistant", content: "hello", reasoning_content: "I thought", refusal: "no" },
+        { role: "user", content: "say ok" },
+      ],
+    }),
+  })
+  assert.deepEqual(JSON.parse(f.chats()[0].body).messages, [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "hi" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: [{ type: "text", text: "I thought" }] },
+        { type: "text", text: "hello" },
+      ],
+    },
+    { role: "user", content: "say ok" },
+  ])
+})
+
+test("a tool turn's exchange goes out with only the fields its roles name", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "m",
+      messages: [
+        { role: "user", content: "read" },
+        {
+          role: "assistant",
+          content: null,
+          reasoning_details: [{ text: "t" }],
+          tool_calls: [{ id: "c1", index: 0, type: "function", function: { name: "read", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "c1", content: "data", is_error: false, name: "read" },
+        { role: "user", content: "say ok" },
+      ],
+    }),
+  })
+  assert.deepEqual(JSON.parse(f.chats()[0].body).messages, [
+    { role: "user", content: "read" },
+    {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: [{ type: "text", text: "t" }] }],
+      tool_calls: [{ id: "c1", index: 0, type: "function", function: { name: "read", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "c1", content: "data", name: "read" },
+    { role: "user", content: "say ok" },
+  ])
+})
+
+test("a body Mistral takes as it comes leaves in the bytes it arrived in", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  // stream_options and metadata are not in Mistral's published schema but
+  // are answered 200, so they are none of this plugin's business
+  const sent = JSON.stringify({
+    model: "mistral-medium-latest",
+    max_tokens: 8,
+    stream: true,
+    stream_options: { include_usage: true },
+    metadata: { k: "v" },
+    messages: [{ role: "user", content: "say ok" }],
+  })
+  await loader.fetch(CHAT, { method: "POST", headers: { "content-type": "application/json" }, body: sent })
+  assert.equal(f.chats()[0].body, sent)
+  // and a number survives the round trip untouched, because there is none
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: '{"model":"m","user":"u","temperature":0.30000000000000004,"messages":[]}',
+  })
+  assert.equal(f.chats()[1].body, '{"model":"m","temperature":0.30000000000000004,"messages":[]}')
+})
+
+test("only a chat completions POST is reshaped", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(`${_internal.BASE}/models`, { method: "GET" })
+  const models = f.seen.filter((s) => s.url.includes("/models"))
+  assert.equal(models.length, 1)
+  assert.equal(models[0].body, null)
+  await loader.fetch(CHAT, { method: "POST", body: "not json at all" })
+  assert.equal(f.chats()[0].body, "not json at all")
+  await loader.fetch(CHAT, { method: "POST", headers: { "content-type": "text/plain" }, body: '{"user":"u"}' })
+  assert.equal(f.chats()[1].body, '{"user":"u"}')
+})
+
+test("a Request's body is reshaped too, and the retry sends the same one", async () => {
+  let tokenCalls = 0
+  let chats = 0
+  const f = bodyRecorder()
+  const wrapped = async (input, init) => {
+    const url = input instanceof Request ? input.url : String(input)
+    if (url.includes(".well-known"))
+      return json(200, { authorization_endpoint: "https://auth.example/authorize", token_endpoint: "https://auth.example/token" })
+    if (url.includes("/token")) {
+      tokenCalls++
+      return json(200, { access_token: "at1", refresh_token: "rt1", id_token: mkId({ sub: "u41" }), expires_in: 3600 })
+    }
+    if (url.includes("/chat/completions")) {
+      // the body is recorded before the answer is decided, so both the
+      // attempt that was turned away and the retry are on record
+      const out = await f(input, init)
+      return json(++chats === 1 ? 401 : 200, await out.json())
+    }
+    return f(input, init)
+  }
+  wrapped.seen = f.seen
+  wrapped.chats = f.chats
+  const p = await createPlugin({ fetchImpl: wrapped })
+  const loader = await p.auth.loader(async () => ({
+    type: "oauth", access: "at", refresh: "rt", expires: Date.now() + 3600_000, idToken: mkId({ sub: "u41" }), subject: "u41",
+  }))
+  const res = await loader.fetch(new Request(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", user: "user_x", messages: [{ role: "user", content: "hi" }] }),
+  }))
+  assert.equal(res.status, 200)
+  assert.equal(chats, 2, "the 401 was retried")
+  assert.equal(tokenCalls, 1)
+  assert.equal(f.chats().length, 2)
+  for (const c of f.chats()) {
+    assert.equal(c.body, JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }))
+    assert.equal(c.headers.get("authorization"), `Bearer ${mkId({ sub: "u41" })}`)
+  }
+})
+
+test("an API key loader shapes the same chat body as the plan path", async () => {
+  const f = bodyRecorder()
+  const p = await createPlugin({ fetchImpl: f })
+  const loader = await p.auth.loader(async () => ({ type: "api", key: "k" }))
+  assert.equal(typeof loader.fetch, "function")
+  const res = await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", user: "u", messages: [{ role: "user", content: "hi" }] }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(f.chats()[0].body, JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }))
+  assert.equal(f.chats()[0].headers.get("authorization"), "Bearer k")
+})
+
+test("shaping drops a stale content-length header", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  const body = JSON.stringify({ model: "m", user: "u", messages: [] })
+  await loader.fetch(CHAT, {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) },
+    body,
+  })
+  assert.notEqual(f.chats()[0].body, body)
+  assert.equal(f.chats()[0].headers.get("content-length"), null)
+})
+
+test("a no-op chat body is not reserialized", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  const body = '{ "model" : "m", "messages" : [ { "role" : "user", "content" : "hi" } ] }'
+  await loader.fetch(CHAT, { method: "POST", headers: { "content-type": "application/json" }, body })
+  assert.equal(f.chats()[0].body, body)
+})
+
+test("an Object-prototype role is left for Mistral instead of throwing", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  const body = JSON.stringify({ model: "m", messages: [{ role: "constructor", content: "x" }] })
+  const res = await loader.fetch(CHAT, { method: "POST", headers: { "content-type": "application/json" }, body })
+  assert.equal(res.status, 200)
+  assert.equal(f.chats()[0].body, body)
+})
+
+test("a non-POST chat URL is not reshaped", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  const body = '{"user":"u"}'
+  await loader.fetch(CHAT, { method: "GET", headers: { "content-type": "application/json" }, body })
+  assert.equal(f.chats()[0].body, body)
+})
+
+test("a URL input is reshaped too", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  await loader.fetch(new URL(CHAT), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", user: "u", messages: [] }),
+  })
+  assert.equal(f.chats()[0].body, JSON.stringify({ model: "m", messages: [] }))
+})
+
+test("a caller abort stops a streamed body before anything is sent", async () => {
+  const f = bodyRecorder()
+  const loader = await loaderOver(f)
+  const stream = new ReadableStream({ start() {} })
+  await assert.rejects(
+    () => loader.fetch(CHAT, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: stream,
+      signal: AbortSignal.abort(),
+    }),
+    (e) => e.name === "AbortError",
+  )
+  assert.equal(f.chats().length, 0)
+})
+
 test("the chat request carries a deadline of its own, and the caller's signal wins", async () => {
   const seen = []
   const f = async (input, init) => {
@@ -558,6 +936,8 @@ test("newerSession answers with the session file's bundle only when it is this a
   _internal.saveSession(f, stored)
   const older = { type: "oauth", access: "at0", refresh: "rt0", expires: Date.now() + HOUR, idToken: mkId({ sub: "a" }), subject: "a" }
   assert.equal(_internal.newerSession(f, older), stored, "the file's is the one whose refresh token is unspent")
+  const noSubject = { type: "oauth", access: "at0b", refresh: "rt0b", expires: Date.now() + HOUR, idToken: mkId({ sub: "a" }) }
+  assert.equal(_internal.newerSession(f, noSubject), stored, "the ID token's subject answers for a host that dropped the field")
   assert.equal(_internal.newerSession(f, stored), stored)
   const newer = { type: "oauth", access: "at2", refresh: "rt2", expires: Date.now() + 3 * HOUR, idToken: mkId({ sub: "a" }), subject: "a" }
   assert.equal(_internal.newerSession(f, newer), newer, "a newer sign-in is not shadowed by the file")
@@ -619,7 +999,11 @@ test("a restart answers from the session file, spending no refresh token", async
 })
 
 test("a session file that cannot be written leaves the turn working", async () => {
-  process.env.VIBE_SESSION_FILE = "/no-such-dir-vibe/session.json"
+  // A file where the parent directory should be: mkdir and the lock both
+  // fail, without writing anything outside the test's own home.
+  const blocker = join(EMPTY_VIBE_HOME, "not-a-directory")
+  writeFileSync(blocker, "")
+  process.env.VIBE_SESSION_FILE = join(blocker, "session.json")
   const f = fakeFetch([
     [".well-known", () => json(200, { authorization_endpoint: "a", token_endpoint: "https://auth.example/token" })],
     ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
@@ -876,4 +1260,312 @@ test("provider.models marks the account expired when a table is refused", async 
     idExpires: (Math.floor(Date.now() / 1000) + 3600) * 1000,
     subject: "u11",
   } }), (e) => e.signIn === "expired")
+})
+
+test("the first sign-in is persisted and its home directory is created", () => {
+  const root = mkdtempSync(join(tmpdir(), "vibe-first-signin-"))
+  process.env.VIBE_HOME = join(root, "does-not-exist-yet")
+  process.env.VIBE_SESSION_FILE = join(process.env.VIBE_HOME, "nested", "session.json")
+  const idToken = mkId({ sub: "first-signin" })
+  try {
+    _internal.saveSession(fakeFetch([]), {
+      access: "at0", refresh: "rt0", idToken,
+      expires: Date.now() + 3600_000, idExpires: Date.now() + 3600_000,
+      subject: "first-signin", email: "me@x.y",
+    })
+    const file = JSON.parse(readFileSync(_internal.sessionPath(), "utf8"))
+    assert.equal(file.refresh, "rt0")
+    assert.equal(file.idToken, idToken)
+    if (process.platform !== "win32")
+      assert.equal(statSync(_internal.sessionPath()).mode & 0o777, 0o600)
+    assert.equal(_internal.loadSession(fakeFetch([])).subject, "first-signin")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("two plugin instances renewing one session spend one refresh token", async () => {
+  const spent = new Set()
+  let tokenCalls = 0
+  let chats = 0
+  const backend = async (url, init) => {
+    url = String(url)
+    if (url.includes(".well-known")) return json(200, {
+      authorization_endpoint: "https://auth.example/authorize",
+      token_endpoint: "https://auth.example/token",
+    })
+    if (url.includes("/token")) {
+      const rt = new URLSearchParams(init.body).get("refresh_token")
+      if (spent.has(rt)) return json(400, { error: "invalid_grant" })
+      spent.add(rt)
+      tokenCalls++
+      return json(200, {
+        access_token: `at${tokenCalls}`, refresh_token: `rt${tokenCalls}`,
+        id_token: mkId({ sub: "race" }), expires_in: 3600,
+      })
+    }
+    if (url.includes("/users/me/workspaces")) return json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })
+    if (url.includes("/chat/completions")) {
+      chats++
+      return json(200, { ok: true })
+    }
+    return json(404, {})
+  }
+  const p1 = await createPlugin({ fetchImpl: (url, init) => backend(url, init) })
+  const p2 = await createPlugin({ fetchImpl: (url, init) => backend(url, init) })
+  const stored = {
+    type: "oauth", access: "at0", refresh: "rt0",
+    expires: Date.now() - 1000, idToken: mkId({ sub: "race" }), subject: "race",
+  }
+  const call = async (p) => {
+    const loader = await p.auth.loader(async () => stored)
+    return (await loader.fetch(`${_internal.BASE}/chat/completions`, { method: "POST" })).status
+  }
+  const statuses = await Promise.all([call(p1), call(p2)])
+  assert.deepEqual(statuses, [200, 200])
+  assert.equal(tokenCalls, 1, "the shared refresh token was spent once")
+  assert.equal(chats, 2)
+})
+
+test("a stale session lock directory is taken over", async () => {
+  const lock = `${_internal.sessionPath()}.lock`
+  mkdirSync(lock, { mode: 0o700 })
+  writeFileSync(join(lock, "owner"), "stale")
+  utimesSync(lock, new Date(0), new Date(0))
+  let tokenCalls = 0
+  const f = fakeFetch([
+    [".well-known", () => json(200, { authorization_endpoint: "a", token_endpoint: "https://auth.example/token" })],
+    ["/token", () => { tokenCalls++; return json(200, { access_token: "at1", refresh_token: "rt1", id_token: mkId({ sub: "stale-lock" }), expires_in: 3600 }) }],
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/chat/completions", () => json(200, { ok: true })],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const loader = await p.auth.loader(async () => ({
+    type: "oauth", access: "at0", refresh: "rt0",
+    expires: Date.now() - 1000, idToken: mkId({ sub: "stale-lock" }), subject: "stale-lock",
+  }))
+  const res = await loader.fetch(`${_internal.BASE}/chat/completions`, { method: "POST" })
+  assert.equal(res.status, 200)
+  assert.equal(tokenCalls, 1)
+  assert.throws(() => statSync(lock), (e) => e.code === "ENOENT")
+})
+
+test("a Request body is replayed after a 401", async () => {
+  let tokenCalls = 0
+  let chats = 0
+  const f = async (input, init) => {
+    const url = input instanceof Request ? input.url : String(input)
+    if (url.includes(".well-known")) return json(200, {
+      authorization_endpoint: "https://auth.example/authorize",
+      token_endpoint: "https://auth.example/token",
+    })
+    if (url.includes("/token")) {
+      tokenCalls++
+      return json(200, { access_token: "at1", refresh_token: "rt1", id_token: mkId({ sub: "request-retry" }), expires_in: 3600 })
+    }
+    if (url.includes("/users/me/workspaces")) return json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })
+    if (url.includes("/chat/completions")) {
+      chats++
+      assert.ok(input instanceof Request, "the Request itself goes out")
+      assert.equal(await input.text(), '{"hello":"world"}')
+      return json(chats === 1 ? 401 : 200, { ok: true })
+    }
+    return json(404, {})
+  }
+  const p = await createPlugin({ fetchImpl: f })
+  const loader = await p.auth.loader(async () => ({
+    type: "oauth", access: "at0", refresh: "rt0",
+    expires: Date.now() + 3600_000, idToken: mkId({ sub: "request-retry" }), subject: "request-retry",
+  }))
+  const res = await loader.fetch(new Request(`${_internal.BASE}/chat/completions`, {
+    method: "POST", body: '{"hello":"world"}', headers: { "content-type": "application/json" },
+  }))
+  assert.equal(res.status, 200)
+  assert.equal(chats, 2)
+  assert.equal(tokenCalls, 1)
+})
+
+test("a caller's abort is rethrown instead of becoming a gateway error", async () => {
+  const f = async (url) => {
+    if (String(url).includes("/users/me/workspaces"))
+      return json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })
+    if (String(url).includes("/chat/completions")) throw new DOMException("aborted by caller", "AbortError")
+    return json(404, {})
+  }
+  const p = await createPlugin({ fetchImpl: f })
+  const loader = await p.auth.loader(async () => ({
+    type: "oauth", access: "at", refresh: "rt",
+    expires: Date.now() + 3600_000, idToken: mkId({ sub: "abort" }), subject: "abort",
+  }))
+  await assert.rejects(
+    () => loader.fetch(`${_internal.BASE}/chat/completions`, { method: "POST", signal: AbortSignal.abort() }),
+    (e) => e.name === "AbortError",
+  )
+})
+
+test("authorize handles a callback-server failure before the host calls callback", async () => {
+  const squatter = createServer()
+  await new Promise((r) => squatter.listen(0, "127.0.0.1", r))
+  const port = squatter.address().port
+  process.env.VIBE_CLI_OIDC_REDIRECT_URI = `http://127.0.0.1:${port}/callback`
+  const f = fakeFetch([[".well-known", () => json(200, {
+    authorization_endpoint: "https://auth.example/authorize",
+    token_endpoint: "https://auth.example/token",
+  })]])
+  const p = await createPlugin({ fetchImpl: f })
+  let unhandled
+  const onUnhandled = (e) => { unhandled = e }
+  process.on("unhandledRejection", onUnhandled)
+  try {
+    const flow = await p.auth.methods[0].authorize()
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(unhandled, undefined)
+    const result = await flow.callback()
+    assert.equal(result.type, "failed")
+  } finally {
+    process.off("unhandledRejection", onUnhandled)
+    await new Promise((r) => squatter.close(r))
+  }
+})
+
+test("modelTable excludes embedding, OCR and catalog non-chat entries", async () => {
+  const f = fakeFetch([
+    ["/model-catalog", () => json(200, { models: [
+      { id: "chat-a", capabilities: { completion_chat: true } },
+      { id: "hidden-a", capabilities: { completion_chat: false } },
+    ] })],
+    ["/models", () => json(200, { data: [
+      { id: "chat-a" }, { id: "mistral-embed" }, { id: "mistral-ocr-latest" },
+      { id: "hidden-a" }, { id: "chat-b" },
+    ] })],
+  ])
+  const table = await _internal.modelTable(f, {})
+  assert.deepEqual(table.ids, ["chat-a", "chat-b"])
+})
+
+test("modelTable limits a plan account to catalog and verified bootstrap ids", async () => {
+  const f = fakeFetch([
+    ["/model-catalog", () => json(200, { models: [
+      { id: "catalog-chat", capabilities: { completion_chat: true } },
+      { id: "hidden-chat", capabilities: { completion_chat: false } },
+    ] })],
+    ["/models", () => json(200, { data: [
+      { id: "catalog-chat" }, { id: "codestral-latest" },
+      { id: "devstral-medium-latest" }, { id: "mistral-large-latest" },
+      { id: "hidden-chat" }, { id: "new-chat" },
+    ] })],
+  ])
+  const table = await _internal.modelTable(f, {}, { plan: true })
+  assert.deepEqual(table.ids, ["catalog-chat", "codestral-latest"])
+  const open = await _internal.modelTable(f, {})
+  assert.ok(open.ids.includes("devstral-medium-latest"))
+  assert.ok(open.ids.includes("new-chat"))
+})
+
+test("the last plan catalog still filters an account when a later read fails", async () => {
+  let catalogDown = false
+  const f = async (url) => {
+    if (String(url).includes("/model-catalog"))
+      return catalogDown ? json(500, {}) : json(200, { models: [{ id: "catalog-chat" }] })
+    if (String(url).includes("/models"))
+      return json(200, { data: [{ id: "catalog-chat" }, { id: "devstral-medium-latest" }] })
+    return json(404, {})
+  }
+  assert.deepEqual((await _internal.modelTable(f, {}, { plan: true })).ids, ["catalog-chat"])
+  catalogDown = true
+  assert.deepEqual((await _internal.modelTable(f, {}, { plan: true })).ids, ["catalog-chat"])
+})
+
+test("budgetWindow keeps month-end cycles and drops an invalid reset", () => {
+  assert.deepEqual(
+    _internal.budgetWindow({ usage_percentage: 1, reset_at: "2026-03-31T00:00:00Z" }, "Vibe Code"),
+    { name: "Vibe Code", used: 1, span: 31 * 86400, resetsAt: "2026-03-31T00:00:00Z" },
+  )
+  const invalid = _internal.budgetWindow({ usage_percentage: 1, reset_at: "not-a-date" }, "API")
+  assert.equal(invalid.span, 30 * 86400)
+  assert.equal("resetsAt" in invalid, false)
+})
+
+test("redirectUriOf only accepts an explicit loopback http port", () => {
+  for (const raw of ["http://0.0.0.0:8766/callback", "https://127.0.0.1:8766/callback", "http://127.0.0.1/callback", "http://127.0.0.1:0/callback", "not a url"]) {
+    process.env.VIBE_CLI_OIDC_REDIRECT_URI = raw
+    assert.throws(() => _internal.redirectUriOf())
+  }
+  process.env.VIBE_CLI_OIDC_REDIRECT_URI = "http://localhost:8766/callback"
+  assert.equal(_internal.redirectUriOf(), "http://localhost:8766/callback")
+})
+
+test("resolveApiKey accepts export syntax and a BOM", () => {
+  const home = mkdtempSync(join(tmpdir(), "vibe-env-"))
+  process.env.VIBE_HOME = home
+  writeFileSync(join(home, ".env"), '\uFEFFexport MISTRAL_API_KEY="from-export"\n')
+  try {
+    assert.equal(_internal.resolveApiKey(), "from-export")
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test("auth.refresh surfaces a refused sign-in but keeps transient failures quiet", async () => {
+  const discovery = () => json(200, {
+    authorization_endpoint: "https://auth.example/authorize",
+    token_endpoint: "https://auth.example/token",
+  })
+  const auth = {
+    type: "oauth", access: "at0", refresh: "rt0",
+    expires: Date.now() - 1000, idToken: mkId({ sub: "refresh-error" }), subject: "refresh-error",
+  }
+  const refused = await createPlugin({ fetchImpl: fakeFetch([
+    [".well-known", discovery],
+    ["/token", () => json(400, { error: "invalid_grant" })],
+  ]) })
+  await assert.rejects(() => refused.auth.refresh(auth), (e) => e.signIn === "expired")
+
+  const transient = await createPlugin({ fetchImpl: fakeFetch([
+    [".well-known", discovery],
+    ["/token", () => { throw new Error("dns") }],
+  ]) })
+  assert.equal(await transient.auth.refresh(auth), undefined)
+})
+
+test("a JWKS outage does not spend the single-use refresh token", async () => {
+  let tokenCalls = 0
+  const f = fakeFetch([
+    [".well-known", () => json(200, {
+      issuer: _internal.ISSUER,
+      authorization_endpoint: "https://auth.example/authorize",
+      token_endpoint: "https://auth.example/token",
+      jwks_uri: "https://auth.example/jwks",
+    })],
+    ["/jwks", () => json(500, {})],
+    ["/token", () => { tokenCalls++; return json(200, BUNDLE()) }],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const loader = await p.auth.loader(async () => ({
+    type: "oauth", access: "at0", refresh: "rt0",
+    expires: Date.now() - 1000, idToken: mkId({ sub: "jwks-down" }), subject: "jwks-down",
+  }))
+  const res = await loader.fetch(`${_internal.BASE}/chat/completions`, { method: "POST" })
+  assert.equal(res.status, 502)
+  assert.equal(tokenCalls, 0)
+})
+
+test("a 403 model refusal is a permission problem, not an expired sign-in", async () => {
+  const f = fakeFetch([
+    ["/users/me/workspaces", () => json(200, { workspaces: [{ id: "w1", organization_id: "o1" }] })],
+    ["/model-catalog", () => json(403, {})],
+    ["/models", () => json(403, {})],
+  ])
+  const p = await createPlugin({ fetchImpl: f })
+  const auth = {
+    type: "oauth", access: "at", refresh: "rt",
+    expires: Date.now() + 3600_000, idToken: mkId({ sub: "forbidden" }), subject: "forbidden",
+  }
+  const usage = await p.auth.usage(async () => auth)
+  assert.equal(usage.signIn, undefined)
+  assert.match(usage.error, /403/)
+  await assert.rejects(
+    () => p.provider.models({ models: {} }, { auth }),
+    (e) => e.signIn === undefined && /403/.test(e.message),
+  )
 })
